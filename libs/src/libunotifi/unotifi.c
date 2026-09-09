@@ -138,6 +138,21 @@ int unotifi_send_handshake(int fd, pid_t pid, const char *service_name) {
     return (n > 0 && n < (int)sizeof(packet)) ? unotifi_send_block(fd, packet) : UNOTIFI_ERR_PROTOCOL;
 }
 
+int unotifi_send_handshake_response(int fd, const char *info) {
+    if (fd < 0 || !info) return UNOTIFI_ERR;
+
+    char packet[UNOTIFI_BUFFER_SIZE];
+    int n = snprintf(packet, sizeof(packet),
+        "SUPPORT UNOTIFI\n"
+        "SHAKE OK\n"
+        "\n"
+        "%s\n"
+        "\n",
+        info);
+
+    return (n > 0 && n < (int)sizeof(packet)) ? unotifi_send_block(fd, packet) : UNOTIFI_ERR_PROTOCOL;
+}
+
 int unotifi_recv_handshake(int fd, char **info_out) {
     if (fd < 0 || !info_out) return UNOTIFI_ERR;
 

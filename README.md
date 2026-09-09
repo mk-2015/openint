@@ -2,6 +2,7 @@
 - The minimal init system for your custom linux distros!
 
 ## Prebuilt shell utilities
+- All scripts are in the [scripts directory](scripts/)
 * run-graphic-vda-networking.sh
     - Run graphics [V]
     - Run with disk.img [V]

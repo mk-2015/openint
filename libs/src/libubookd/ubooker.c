@@ -3,6 +3,8 @@
 #include <string.h>
 #include <unistd.h>
 #include <stdarg.h>
+#include <pthread.h>
+#include <errno.h>
 
 #include <libubookd/booker.h>
 
@@ -32,11 +34,13 @@ int OpenBook(char* path, BookState state, Book* book) {
 }
 
 /* Write a log entry to the Book file */
+extern pthread_mutex_t g_book_mutex;
 int BookWriteLog(Book* book, const char* format, LogLevel level, ...) {
     if (!book || !book->inited || !format) {
         return -1;
     }
 
+    pthread_mutex_lock(&g_book_mutex);
     fseek(book->fp, 0, SEEK_END);
     char logvl[64];
     if (level == LOG_LEVEL_INFO) {
@@ -52,24 +56,19 @@ int BookWriteLog(Book* book, const char* format, LogLevel level, ...) {
     } else {
         strcpy(logvl, "[UNKNOWN] ");
     }
-    
+
     /* Format the log message with variadic arguments */
     char formatted[4096];
     va_list args;
     va_start(args, level);
     int n = vsnprintf(formatted, sizeof(formatted), format, args);
     va_end(args);
-    
-    if (n < 0 || n >= (int)sizeof(formatted)) {
-        return -1;
-    }
-    
-    size_t bytes_written = fprintf(book->fp, "%s%s", logvl, formatted);
-    if (bytes_written != strlen(logvl) + strlen(formatted)) {
-        return -1;
-    }
 
-    fflush(book->fp);
+    if (n > 0) {
+        fprintf(book->fp, "%s%s\n", logvl, formatted);
+        fflush(book->fp);
+    }
+    pthread_mutex_unlock(&g_book_mutex);
     return 0;
 }
 
@@ -158,6 +157,88 @@ int BookReadLastLog(Book* book, char* buffer, size_t buffer_size) {
 
     buffer[bytes_read] = '\0';
     return bytes_read;
+}
+
+int BookQueryLog(Book* book, const char* query, char* buffer, size_t buffer_size,
+                 unsigned int* matches) {
+    if (!book || !book->inited || !query || !buffer || buffer_size == 0 || !matches) {
+        return -1;
+    }
+
+    pthread_mutex_lock(&g_book_mutex);
+    rewind(book->fp);
+    *matches = 0;
+    size_t used = 0;
+    char line[4096];
+
+    while (fgets(line, sizeof(line), book->fp)) {
+        if (!strstr(line, query)) {
+            continue;
+        }
+
+        (*matches)++;
+        size_t length = strlen(line);
+        if (used + length + 1 >= buffer_size) {
+            pthread_mutex_unlock(&g_book_mutex);
+            return -2;
+        }
+        memcpy(buffer + used, line, length);
+        used += length;
+    }
+
+    buffer[used] = '\0';
+    pthread_mutex_unlock(&g_book_mutex);
+    return 0;
+}
+
+int BookRemoveLog(Book* book, const char* query, unsigned int* removed) {
+    if (!book || !book->inited || !query || !removed) {
+        return -1;
+    }
+
+    pthread_mutex_lock(&g_book_mutex);
+    char temp_path[4096];
+    int path_length = snprintf(temp_path, sizeof(temp_path), "%s.tmp", book->path);
+    if (path_length < 0 || (size_t)path_length >= sizeof(temp_path)) {
+        pthread_mutex_unlock(&g_book_mutex);
+        return -1;
+    }
+
+    FILE *temp = fopen(temp_path, "w");
+    if (!temp) {
+        pthread_mutex_unlock(&g_book_mutex);
+        return -1;
+    }
+
+    rewind(book->fp);
+    *removed = 0;
+    char line[4096];
+    while (fgets(line, sizeof(line), book->fp)) {
+        if (strstr(line, query)) {
+            (*removed)++;
+        } else if (fputs(line, temp) == EOF) {
+            fclose(temp);
+            unlink(temp_path);
+            pthread_mutex_unlock(&g_book_mutex);
+            return -1;
+        }
+    }
+
+    if (fclose(temp) != 0 || rename(temp_path, book->path) != 0) {
+        unlink(temp_path);
+        pthread_mutex_unlock(&g_book_mutex);
+        return -1;
+    }
+
+    fclose(book->fp);
+    book->fp = fopen(book->path, "r+");
+    if (!book->fp) {
+        pthread_mutex_unlock(&g_book_mutex);
+        return -1;
+    }
+
+    pthread_mutex_unlock(&g_book_mutex);
+    return 0;
 }
 
 /* Change Book file path */

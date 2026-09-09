@@ -21,6 +21,7 @@ int openCommunicationChannel(const char *socket_path);
 int acceptCommunicationChannel(int listen_fd);
 
 int unotifi_send_handshake(int fd, pid_t pid, const char *service_name);
+int unotifi_send_handshake_response(int fd, const char *info);
 int unotifi_recv_handshake(int fd, char **info_out);
 
 int unotifi_send_unshake_close(int fd);

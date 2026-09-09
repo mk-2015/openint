@@ -29,6 +29,8 @@ int BookWriteLog(Book* book, const char* format, LogLevel level, ...);
 int BookReadLineRange(unsigned int start_line, unsigned int end_line, Book* book, char* buffer, size_t buffer_size);
 int BookReadLog(unsigned int line_number, Book* book, char* buffer, size_t buffer_size);
 int BookReadLastLog(Book* book, char* buffer, size_t buffer_size);
+int BookQueryLog(Book* book, const char* query, char* buffer, size_t buffer_size, unsigned int* matches);
+int BookRemoveLog(Book* book, const char* query, unsigned int* removed);
 int BookChangePath(Book* book, const char* new_path);
 int CloseBook(Book* book);
 

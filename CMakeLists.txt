@@ -14,13 +14,21 @@ else()
     set(MINITD_LIBS "")
 endif()
 
-add_subdirectory(libs/tools/src)
-
-file(GLOB_RECURSE SRCS "src/*.c")
+file(GLOB_RECURSE SRCS CONFIGURE_DEPENDS "src/code/*.c")
 
 add_executable(init ${SRCS})
 
-target_include_directories(init PRIVATE include libs/include)
+target_include_directories(init PRIVATE src/include libs/include)
 target_link_options(init PRIVATE -static)
 
 target_link_libraries(init PRIVATE ${MINITD_LIBS})
+
+file(GLOB UTILITY_SRCS CONFIGURE_DEPENDS "src/utils/*.c")
+
+foreach(UTILITY_SRC ${UTILITY_SRCS})
+    get_filename_component(UTILITY_NAME ${UTILITY_SRC} NAME_WE)
+    add_executable(${UTILITY_NAME} ${UTILITY_SRC})
+    target_include_directories(${UTILITY_NAME} PRIVATE src/include libs/include)
+    target_link_options(${UTILITY_NAME} PRIVATE -static)
+    target_link_libraries(${UTILITY_NAME} PRIVATE ${MINITD_LIBS})
+endforeach()
