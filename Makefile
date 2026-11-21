@@ -4,15 +4,29 @@ MAKE ?= make
 INNER_DIR ?= inner
 OUT_DIR ?= out
 ROOTFS_DIR ?= rootfs
-ROOTFS_STAGE ?= build/rootfs
-INITRAMFS_IMAGE ?= build/initramfs.img
-VDA_IMAGE ?= build/oint.vda
+
+# Staging & Image Outputs
+BUILD_DIR ?= qemu
+ROOTFS_STAGE ?= $(BUILD_DIR)/rootfs
+INITRAMFS_IMAGE ?= $(BUILD_DIR)/initramfs.img
+VDA_IMAGE ?= $(BUILD_DIR)/disk.vda
 VDA_SIZE ?= 1G
+
+# Initramfs & Kernel Settings
 DRACUT ?= dracut
 MKINITRAMFS ?= mkinitramfs
 MKINITCPIO ?= mkinitcpio
 INITRAMFS_TOOL ?= auto
 KERNEL_RELEASE ?= $(shell uname -r)
+KERNEL_IMAGE ?= /boot/vmlinuz-$(KERNEL_RELEASE)
+
+# QEMU Settings
+QEMU ?= qemu-system-x86_64
+QEMU_MEMORY ?= 1G
+QEMU_APPEND ?= root=/dev/vda rootfstype=ext4 rw init=/init console=tty0 -- --rescue
+QEMU_EXTRA_ARGS ?=
+
+# Compiler / Project Discovery
 PROJECT_OUT_DIR := $(abspath $(OUT_DIR))
 EINC := -I$(PROJECT_OUT_DIR)/include -L$(PROJECT_OUT_DIR)/lib
 
@@ -28,7 +42,7 @@ TOOL_PROJECTS := $(foreach project,$(PROJECTS),$(if $(filter tool,$(call project
 INIT_PROJECTS := $(foreach project,$(PROJECTS),$(if $(filter init,$(call project_type,$(project))),$(project)))
 INVALID_PROJECTS := $(foreach project,$(PROJECTS),$(if $(filter tool lib init,$(call project_type,$(project))),,$(project)))
 
-.PHONY: all validate libraries tools init stage-rootfs initramfs vda clean
+.PHONY: all validate libraries tools init stage-rootfs initramfs vda disk.vda qemu-all run clean distclean
 
 all: init
 
@@ -95,7 +109,6 @@ init: tools
 	cp -a "$$project/bin/init" "$(OUT_DIR)/bin/init"
 
 stage-rootfs: init
-	@rm -rf "$(ROOTFS_STAGE)"
 	@mkdir -p "$(ROOTFS_STAGE)/usr/bin" "$(ROOTFS_STAGE)/usr/lib"
 	@if [ -d "$(ROOTFS_DIR)" ]; then cp -a "$(ROOTFS_DIR)/." "$(ROOTFS_STAGE)/"; fi
 	@mkdir -p "$(ROOTFS_STAGE)/dev" "$(ROOTFS_STAGE)/proc" "$(ROOTFS_STAGE)/sys" \
@@ -107,13 +120,15 @@ stage-rootfs: init
 	@mkdir -p "$(ROOTFS_STAGE)/sbin"
 	@ln -sf ../init "$(ROOTFS_STAGE)/sbin/init"
 
-initramfs:
+$(INITRAMFS_IMAGE):
 	@mkdir -p "$(dir $(INITRAMFS_IMAGE))"
 	@set -eu; \
 	case "$(INITRAMFS_TOOL)" in \
 		dracut) \
 			command -v "$(DRACUT)" >/dev/null 2>&1 || { echo "Initramfs tool not found: $(DRACUT)." >&2; exit 127; }; \
-			"$(DRACUT)" --force --no-hostonly --kver "$(KERNEL_RELEASE)" "$(INITRAMFS_IMAGE)" ;; \
+			"$(DRACUT)" --force --no-hostonly \
+				-o "plymouth systemd systemd-initrd systemd-ask-password console-setup" \
+				--kver "$(KERNEL_RELEASE)" "$(INITRAMFS_IMAGE)" ;; \
 		mkinitcpio) \
 			command -v "$(MKINITCPIO)" >/dev/null 2>&1 || { echo "Initramfs tool not found: $(MKINITCPIO)." >&2; exit 127; }; \
 			"$(MKINITCPIO)" -k "$(KERNEL_RELEASE)" -g "$(INITRAMFS_IMAGE)" ;; \
@@ -121,10 +136,12 @@ initramfs:
 			command -v "$(MKINITRAMFS)" >/dev/null 2>&1 || { echo "Initramfs tool not found: $(MKINITRAMFS)." >&2; exit 127; }; \
 			"$(MKINITRAMFS)" -o "$(INITRAMFS_IMAGE)" "$(KERNEL_RELEASE)" ;; \
 		auto) \
-			if command -v "$(MKINITRAMFS)" >/dev/null 2>&1; then \
+			if command -v "$(DRACUT)" >/dev/null 2>&1; then \
+				"$(DRACUT)" --force --no-hostonly \
+					-o "plymouth systemd systemd-initrd systemd-ask-password console-setup" \
+					--kver "$(KERNEL_RELEASE)" "$(INITRAMFS_IMAGE)"; \
+			elif command -v "$(MKINITRAMFS)" >/dev/null 2>&1; then \
 				"$(MKINITRAMFS)" -o "$(INITRAMFS_IMAGE)" "$(KERNEL_RELEASE)"; \
-			elif command -v "$(DRACUT)" >/dev/null 2>&1; then \
-				"$(DRACUT)" --force --no-hostonly --kver "$(KERNEL_RELEASE)" "$(INITRAMFS_IMAGE)"; \
 			elif command -v "$(MKINITCPIO)" >/dev/null 2>&1; then \
 				"$(MKINITCPIO)" -k "$(KERNEL_RELEASE)" -g "$(INITRAMFS_IMAGE)"; \
 			else \
@@ -136,10 +153,41 @@ initramfs:
 			exit 2 ;; \
 	esac
 
-vda: stage-rootfs
+initramfs: $(INITRAMFS_IMAGE)
+
+vda disk.vda: stage-rootfs
 	@mkdir -p "$(dir $(VDA_IMAGE))"
-	truncate -s "$(VDA_SIZE)" "$(VDA_IMAGE)"
-	mkfs.ext4 -F -d "$(ROOTFS_STAGE)" "$(VDA_IMAGE)"
+	@test -x "$(ROOTFS_STAGE)/init" || { echo "The disk rootfs must contain executable /init." >&2; exit 1; }
+	@if [ ! -f "$(VDA_IMAGE)" ]; then \
+		truncate -s "$(VDA_SIZE)" "$(VDA_IMAGE)"; \
+		mkfs.ext4 -F -d "$(ROOTFS_STAGE)" "$(VDA_IMAGE)"; \
+	else \
+		echo "[VDA] Updating $(VDA_IMAGE) via e2tools..."; \
+		( \
+			cd "$(ROOTFS_STAGE)"; \
+			find . -mindepth 1 -type d | sed 's|^\./||' | while IFS= read -r dir; do \
+				e2mkdir -G 0 -O 0 "$(VDA_IMAGE):/$$dir" 2>/dev/null || true; \
+			done; \
+			find . -type f | sed 's|^\./||' | while IFS= read -r file; do \
+				e2cp -p -G 0 -O 0 "$$file" "$(VDA_IMAGE):/$$file"; \
+			done; \
+		); \
+	fi
+
+
+
+qemu-all: stage-rootfs $(INITRAMFS_IMAGE) vda
+
+run: $(INITRAMFS_IMAGE) vda
+	@test -r "$(KERNEL_IMAGE)" || { echo "Kernel image not found: $(KERNEL_IMAGE)" >&2; exit 1; }
+	$(QEMU) -m "$(QEMU_MEMORY)" \
+		-kernel "$(KERNEL_IMAGE)" \
+		-initrd "$(INITRAMFS_IMAGE)" \
+		-drive "file=$(VDA_IMAGE),format=raw,if=virtio" \
+		-append "$(QEMU_APPEND)" \
+		-no-reboot \
+		-global isa-fdc.fdtypeA=none \
+		$(QEMU_EXTRA_ARGS)
 
 clean:
 	@set -eu; \
@@ -148,4 +196,7 @@ clean:
 			$(MAKE) -C "$$project" clean; \
 		fi; \
 	done
-	rm -rf "$(OUT_DIR)" "$(ROOTFS_STAGE)" "$(INITRAMFS_IMAGE)" "$(VDA_IMAGE)"
+	rm -rf "$(OUT_DIR)" "$(ROOTFS_STAGE)" "$(INITRAMFS_IMAGE)"
+
+distclean: clean
+	rm -rf "$(BUILD_DIR)" "$(VDA_IMAGE)"
