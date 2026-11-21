@@ -1,0 +1,8 @@
+qemu/
+out
+*.so
+*.lib
+*.a
+bin/
+obj/
+lib/

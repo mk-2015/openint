@@ -1,0 +1,151 @@
+.DEFAULT_GOAL := all
+
+MAKE ?= make
+INNER_DIR ?= inner
+OUT_DIR ?= out
+ROOTFS_DIR ?= rootfs
+ROOTFS_STAGE ?= build/rootfs
+INITRAMFS_IMAGE ?= build/initramfs.img
+VDA_IMAGE ?= build/oint.vda
+VDA_SIZE ?= 1G
+DRACUT ?= dracut
+MKINITRAMFS ?= mkinitramfs
+MKINITCPIO ?= mkinitcpio
+INITRAMFS_TOOL ?= auto
+KERNEL_RELEASE ?= $(shell uname -r)
+PROJECT_OUT_DIR := $(abspath $(OUT_DIR))
+EINC := -I$(PROJECT_OUT_DIR)/include -L$(PROJECT_OUT_DIR)/lib
+
+export PROJECT_OUT_DIR
+export CPATH := $(PROJECT_OUT_DIR)/include$(if $(CPATH),:$(CPATH))
+export LIBRARY_PATH := $(PROJECT_OUT_DIR)/lib$(if $(LIBRARY_PATH),:$(LIBRARY_PATH))
+
+PROJECT_MARKERS := $(wildcard $(INNER_DIR)/*/.project)
+PROJECTS := $(patsubst %/.project,%,$(PROJECT_MARKERS))
+project_type = $(strip $(file <$(1)/.project))
+LIB_PROJECTS := $(foreach project,$(PROJECTS),$(if $(filter lib,$(call project_type,$(project))),$(project)))
+TOOL_PROJECTS := $(foreach project,$(PROJECTS),$(if $(filter tool,$(call project_type,$(project))),$(project)))
+INIT_PROJECTS := $(foreach project,$(PROJECTS),$(if $(filter init,$(call project_type,$(project))),$(project)))
+INVALID_PROJECTS := $(foreach project,$(PROJECTS),$(if $(filter tool lib init,$(call project_type,$(project))),,$(project)))
+
+.PHONY: all validate libraries tools init stage-rootfs initramfs vda clean
+
+all: init
+
+validate:
+	@if [ "$(words $(INIT_PROJECTS))" -ne 1 ]; then \
+		echo "Expected exactly one init project under $(INNER_DIR); found $(words $(INIT_PROJECTS))." >&2; \
+		exit 1; \
+	fi
+	@if [ -n "$(strip $(INVALID_PROJECTS))" ]; then \
+		echo "Unknown .project type in: $(INVALID_PROJECTS) (expected tool, lib, or init)." >&2; \
+		exit 1; \
+	fi
+
+libraries: validate
+	@mkdir -p "$(OUT_DIR)/bin" "$(OUT_DIR)/lib" "$(OUT_DIR)/include"
+	@set -eu; \
+	for project in $(LIB_PROJECTS); do \
+		echo "[LIB] $$project"; \
+		$(MAKE) -C "$$project"; \
+		test -d "$$project/lib" || { echo "Library project $$project did not produce lib/." >&2; exit 1; }; \
+		test -d "$$project/include" || { echo "Library project $$project is missing include/." >&2; exit 1; }; \
+		cp -a "$$project/lib/." "$(OUT_DIR)/lib/"; \
+		cp -a "$$project/include/." "$(OUT_DIR)/include/"; \
+	done
+
+tools: libraries
+	@set -eu; \
+	for project in $(TOOL_PROJECTS); do \
+		echo "[TOOL] $$project"; \
+		$(MAKE) -C "$$project"; \
+		test -d "$$project/bin" || { echo "Tool project $$project did not produce bin/." >&2; exit 1; }; \
+		if [ -e "$$project/bin/init" ]; then \
+			echo "Tool project $$project uses reserved binary name init." >&2; \
+			exit 1; \
+		fi; \
+		cp -a "$$project/bin/." "$(OUT_DIR)/bin/"; \
+	done
+
+init: tools
+	@set -eu; \
+	project="$(firstword $(INIT_PROJECTS))"; \
+	echo "[INIT] $$project"; \
+	EINC="$(EINC)"; \
+	seen=" "; \
+	for library in "$(OUT_DIR)"/lib/lib*.a "$(OUT_DIR)"/lib/lib*.so; do \
+		[ -f "$$library" ] || continue; \
+		name=$${library##*/}; \
+		case "$$name" in \
+			lib*.a) name=$${name#lib}; name=$${name%.a} ;; \
+			lib*.so) name=$${name#lib}; name=$${name%.so} ;; \
+			*) continue ;; \
+		esac; \
+		case "$$seen" in *" $$name "*) continue ;; esac; \
+		seen="$$seen$$name "; \
+		EINC="$$EINC -l$$name"; \
+	done; \
+	EINC="$$EINC" $(MAKE) -C "$$project"; \
+	test -d "$$project/bin" || { echo "Init project $$project did not produce bin/." >&2; exit 1; }; \
+	count=$$(find "$$project/bin" -mindepth 1 -maxdepth 1 -type f | wc -l); \
+	if [ "$$count" -ne 1 ] || [ ! -x "$$project/bin/init" ]; then \
+		echo "Init project $$project must produce exactly one executable: bin/init." >&2; \
+		exit 1; \
+	fi; \
+	cp -a "$$project/bin/init" "$(OUT_DIR)/bin/init"
+
+stage-rootfs: init
+	@rm -rf "$(ROOTFS_STAGE)"
+	@mkdir -p "$(ROOTFS_STAGE)/usr/bin" "$(ROOTFS_STAGE)/usr/lib"
+	@if [ -d "$(ROOTFS_DIR)" ]; then cp -a "$(ROOTFS_DIR)/." "$(ROOTFS_STAGE)/"; fi
+	@mkdir -p "$(ROOTFS_STAGE)/dev" "$(ROOTFS_STAGE)/proc" "$(ROOTFS_STAGE)/sys" \
+		"$(ROOTFS_STAGE)/run" "$(ROOTFS_STAGE)/tmp" "$(ROOTFS_STAGE)/root"
+	@chmod 1777 "$(ROOTFS_STAGE)/tmp"
+	@cp -a "$(OUT_DIR)/bin/." "$(ROOTFS_STAGE)/usr/bin/"
+	@cp -a "$(OUT_DIR)/lib/." "$(ROOTFS_STAGE)/usr/lib/"
+	@install -D "$(OUT_DIR)/bin/init" "$(ROOTFS_STAGE)/init"
+	@mkdir -p "$(ROOTFS_STAGE)/sbin"
+	@ln -sf ../init "$(ROOTFS_STAGE)/sbin/init"
+
+initramfs:
+	@mkdir -p "$(dir $(INITRAMFS_IMAGE))"
+	@set -eu; \
+	case "$(INITRAMFS_TOOL)" in \
+		dracut) \
+			command -v "$(DRACUT)" >/dev/null 2>&1 || { echo "Initramfs tool not found: $(DRACUT)." >&2; exit 127; }; \
+			"$(DRACUT)" --force --no-hostonly --kver "$(KERNEL_RELEASE)" "$(INITRAMFS_IMAGE)" ;; \
+		mkinitcpio) \
+			command -v "$(MKINITCPIO)" >/dev/null 2>&1 || { echo "Initramfs tool not found: $(MKINITCPIO)." >&2; exit 127; }; \
+			"$(MKINITCPIO)" -k "$(KERNEL_RELEASE)" -g "$(INITRAMFS_IMAGE)" ;; \
+		mkinitramfs) \
+			command -v "$(MKINITRAMFS)" >/dev/null 2>&1 || { echo "Initramfs tool not found: $(MKINITRAMFS)." >&2; exit 127; }; \
+			"$(MKINITRAMFS)" -o "$(INITRAMFS_IMAGE)" "$(KERNEL_RELEASE)" ;; \
+		auto) \
+			if command -v "$(MKINITRAMFS)" >/dev/null 2>&1; then \
+				"$(MKINITRAMFS)" -o "$(INITRAMFS_IMAGE)" "$(KERNEL_RELEASE)"; \
+			elif command -v "$(DRACUT)" >/dev/null 2>&1; then \
+				"$(DRACUT)" --force --no-hostonly --kver "$(KERNEL_RELEASE)" "$(INITRAMFS_IMAGE)"; \
+			elif command -v "$(MKINITCPIO)" >/dev/null 2>&1; then \
+				"$(MKINITCPIO)" -k "$(KERNEL_RELEASE)" -g "$(INITRAMFS_IMAGE)"; \
+			else \
+				echo "Install mkinitramfs, dracut, or mkinitcpio, or set INITRAMFS_TOOL to an installed tool." >&2; \
+				exit 127; \
+			fi ;; \
+		*) \
+			echo "Unsupported INITRAMFS_TOOL '$(INITRAMFS_TOOL)' (use auto, mkinitramfs, dracut, or mkinitcpio)." >&2; \
+			exit 2 ;; \
+	esac
+
+vda: stage-rootfs
+	@mkdir -p "$(dir $(VDA_IMAGE))"
+	truncate -s "$(VDA_SIZE)" "$(VDA_IMAGE)"
+	mkfs.ext4 -F -d "$(ROOTFS_STAGE)" "$(VDA_IMAGE)"
+
+clean:
+	@set -eu; \
+	for project in $(PROJECTS); do \
+		if [ -f "$$project/Makefile" ] || [ -f "$$project/makefile" ]; then \
+			$(MAKE) -C "$$project" clean; \
+		fi; \
+	done
+	rm -rf "$(OUT_DIR)" "$(ROOTFS_STAGE)" "$(INITRAMFS_IMAGE)" "$(VDA_IMAGE)"
