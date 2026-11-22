@@ -143,12 +143,12 @@ void log_message(int level, const char *format, ...)
     return;
   }
 
-  static const char *const names[] = {"DEBUG", "INFO", "WARN", "ERR"};
+  static const char *const names[] = {"DEBUG", "INFO", "WARN", "ERROR"};
   flockfile(stdout);
   if (level == LOG_DEBUG)
     fprintf(stdout, "%s\n", message);
   else
-    fprintf(stdout, "[    <%s>    ] %s\n", names[level], message);
+    fprintf(stdout, "[    %s    ] %s\n", names[level], message);
   fflush(stdout);
   funlockfile(stdout);
   free(message);

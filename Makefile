@@ -23,7 +23,7 @@ KERNEL_IMAGE ?= /boot/vmlinuz-$(KERNEL_RELEASE)
 # QEMU Settings
 QEMU ?= qemu-system-x86_64
 QEMU_MEMORY ?= 1G
-QEMU_APPEND ?= root=/dev/vda rootfstype=ext4 rw init=/init console=tty0 -- --rescue
+QEMU_APPEND ?= root=/dev/vda rootfstype=ext4 rw init=/init console=tty0 -- PATH=/bin
 QEMU_EXTRA_ARGS ?=
 
 # Compiler / Project Discovery
@@ -158,21 +158,12 @@ initramfs: $(INITRAMFS_IMAGE)
 vda disk.vda: stage-rootfs
 	@mkdir -p "$(dir $(VDA_IMAGE))"
 	@test -x "$(ROOTFS_STAGE)/init" || { echo "The disk rootfs must contain executable /init." >&2; exit 1; }
-	@if [ ! -f "$(VDA_IMAGE)" ]; then \
-		truncate -s "$(VDA_SIZE)" "$(VDA_IMAGE)"; \
-		mkfs.ext4 -F -d "$(ROOTFS_STAGE)" "$(VDA_IMAGE)"; \
-	else \
-		echo "[VDA] Updating $(VDA_IMAGE) via e2tools..."; \
-		( \
-			cd "$(ROOTFS_STAGE)"; \
-			find . -mindepth 1 -type d | sed 's|^\./||' | while IFS= read -r dir; do \
-				e2mkdir -G 0 -O 0 "$(VDA_IMAGE):/$$dir" 2>/dev/null || true; \
-			done; \
-			find . -type f | sed 's|^\./||' | while IFS= read -r file; do \
-				e2cp -p -G 0 -O 0 "$$file" "$(VDA_IMAGE):/$$file"; \
-			done; \
-		); \
-	fi
+	@command -v truncate >/dev/null || { echo "truncate is required to build $(VDA_IMAGE)." >&2; exit 127; }
+	@command -v mkfs.ext4 >/dev/null || { echo "mkfs.ext4 is required to build $(VDA_IMAGE)." >&2; exit 127; }
+	@echo "[VDA] Building $(VDA_IMAGE) from $(ROOTFS_STAGE)..."
+	@rm -f "$(VDA_IMAGE)"
+	@truncate -s "$(VDA_SIZE)" "$(VDA_IMAGE)"
+	@mkfs.ext4 -F -d "$(ROOTFS_STAGE)" "$(VDA_IMAGE)"
 
 
 
@@ -185,7 +176,6 @@ run: $(INITRAMFS_IMAGE) vda
 		-initrd "$(INITRAMFS_IMAGE)" \
 		-drive "file=$(VDA_IMAGE),format=raw,if=virtio" \
 		-append "$(QEMU_APPEND)" \
-		-no-reboot \
 		-global isa-fdc.fdtypeA=none \
 		$(QEMU_EXTRA_ARGS)
 

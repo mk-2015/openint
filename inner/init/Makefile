@@ -1,8 +1,8 @@
 CC       := gcc
 INCLUDE  := include
-CFLAGS   := -std=c23 -Wall -Wextra -O2 -Isrc $(filter -I%,$(EINC)) -I$(INCLUDE)
-LDFLAGS  += -static $(filter -L%,$(EINC))
-LDLIBS   += $(filter -l%,$(EINC))
+CFLAGS   := -std=c23 -Wall -Wextra -O2 -pthread -Isrc $(filter -I%,$(EINC)) -I$(INCLUDE)
+LDFLAGS  += -static -pthread $(filter -L%,$(EINC))
+LDLIBS   += $(filter -l%,$(EINC)) -lcyaml -lyaml
 
 SRC_DIR  := src
 OBJ_DIR  := obj

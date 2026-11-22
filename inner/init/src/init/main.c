@@ -1,8 +1,12 @@
+#define _GNU_SOURCE
 #include <init/macros.h>
 #include <init/log.h>
 #include <init/system.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/wait.h>
+#include <dirent.h>
+#include <stdio.h>
 
 int rescue = 0;
 
@@ -30,6 +34,11 @@ int start_init_system(int argc, char **argv)
     clear_screen(STDERR_FILENO);
     return enter_rescue_mode();
   }
+
+  set_hostname();
+  start_server((uint64_t)argc, argv);
+  ensure();
+  set_environment();
 
   return 0;
 }

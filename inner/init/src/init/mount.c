@@ -1,4 +1,6 @@
 #define _DEFAULT_SOURCE
+#include <sys/swap.h>
+
 #include <init/log.h>
 #include <init/macros.h>
 #include <init/system.h>
@@ -175,4 +177,194 @@ void mount_system(void)
   mkdir("/dev/shm", 1777);
 
   mount_fstab_system();
+}
+
+#define MAX_UNMOUNT_ENTRIES 128
+
+static void unescape_proc_path(char *str)
+{
+  char *src = str;
+  char *dst = str;
+  while (*src)
+  {
+    if (src[0] == '\\' &&
+        src[1] >= '0' && src[1] <= '7' &&
+        src[2] >= '0' && src[2] <= '7' &&
+        src[3] >= '0' && src[3] <= '7')
+    {
+      *dst++ = (char)(((src[1] - '0') << 6) |
+                      ((src[2] - '0') << 3) |
+                       (src[3] - '0'));
+      src += 4;
+    }
+    else
+    {
+      *dst++ = *src++;
+    }
+  }
+  *dst = '\0';
+}
+
+static void disable_swaps(void)
+{
+  int fd = open("/proc/swaps", O_RDONLY);
+  if (fd == -1)
+    return;
+
+  char buf[4096];
+  ssize_t n = read(fd, buf, sizeof(buf) - 1);
+  close(fd);
+  if (n <= 0)
+    return;
+  buf[n] = '\0';
+
+  char *line = buf;
+  int line_num = 0;
+  while (line && *line)
+  {
+    char *next = strchr(line, '\n');
+    if (next)
+      *next++ = '\0';
+
+    /* Skip header line ("Filename Type Size Used Priority") */
+    if (line_num++ > 0 && *line != '\0')
+    {
+      char *space = strpbrk(line, " \t");
+      if (space)
+        *space = '\0';
+
+      unescape_proc_path(line);
+      if (swapoff(line) == 0)
+        log_message(LOG_INFO, "Disabled swap %s", line);
+      else
+        log_message(LOG_WARN, "Failed to disable swap %s: %s", line, strerror(errno));
+    }
+
+    line = next;
+  }
+}
+
+static int is_virtual_fs(const char *target, const char *type)
+{
+  if (strcmp(target, "/proc") == 0 ||
+      strcmp(target, "/sys") == 0 ||
+      strcmp(target, "/dev") == 0 ||
+      strcmp(target, "/run") == 0)
+    return 1;
+
+  if (strcmp(type, "proc") == 0 ||
+      strcmp(type, "sysfs") == 0 ||
+      strcmp(type, "devtmpfs") == 0 ||
+      strcmp(type, "devpts") == 0 ||
+      strcmp(type, "tmpfs") == 0 ||
+      strcmp(type, "cgroup") == 0 ||
+      strcmp(type, "cgroup2") == 0 ||
+      strcmp(type, "securityfs") == 0 ||
+      strcmp(type, "debugfs") == 0 ||
+      strcmp(type, "tracefs") == 0 ||
+      strcmp(type, "pstore") == 0 ||
+      strcmp(type, "efivarfs") == 0)
+    return 1;
+
+  return 0;
+}
+
+void unmount_system(void)
+{
+  disable_swaps();
+
+  int fd = open("/proc/mounts", O_RDONLY);
+  if (fd == -1)
+  {
+    log_message(LOG_WARN, "Could not open /proc/mounts for unmounting: %s", strerror(errno));
+    mount(NULL, "/", NULL, MS_REMOUNT | MS_RDONLY, NULL);
+    return;
+  }
+
+  char buf[8192];
+  ssize_t n = read(fd, buf, sizeof(buf) - 1);
+  close(fd);
+
+  if (n <= 0)
+  {
+    mount(NULL, "/", NULL, MS_REMOUNT | MS_RDONLY, NULL);
+    return;
+  }
+  buf[n] = '\0';
+
+  char *targets[MAX_UNMOUNT_ENTRIES];
+  char *types[MAX_UNMOUNT_ENTRIES];
+  size_t count = 0;
+
+  char *line = buf;
+  while (line && *line && count < MAX_UNMOUNT_ENTRIES)
+  {
+    char *next = strchr(line, '\n');
+    if (next)
+      *next++ = '\0';
+
+    /* Format: <source> <target> <fstype> <options> <dump> <pass> */
+    char *sp1 = strchr(line, ' ');
+    if (sp1)
+    {
+      char *target = sp1 + 1;
+      char *sp2 = strchr(target, ' ');
+      if (sp2)
+      {
+        *sp2 = '\0';
+        char *fstype = sp2 + 1;
+        char *sp3 = strchr(fstype, ' ');
+        if (sp3)
+          *sp3 = '\0';
+
+        unescape_proc_path(target);
+        targets[count] = target;
+        types[count] = fstype;
+        count++;
+      }
+    }
+
+    line = next;
+  }
+
+  /* 1. Unmount real disk filesystems in reverse order (deepest submounts first) */
+  for (size_t i = count; i > 0; i--)
+  {
+    size_t idx = i - 1;
+    const char *target = targets[idx];
+    const char *type = types[idx];
+
+    if (strcmp(target, "/") == 0 || is_virtual_fs(target, type))
+      continue;
+
+    if (umount(target) == 0)
+    {
+      log_message(LOG_INFO, "Unmounted %s", target);
+    }
+    else if (errno == EBUSY)
+    {
+      log_message(LOG_WARN, "Target %s busy, forcing lazy unmount", target);
+      if (umount2(target, MNT_DETACH) == -1)
+        log_message(LOG_ERROR, "Failed to detach %s: %s", target, strerror(errno));
+    }
+    else
+    {
+      log_message(LOG_ERROR, "Failed to unmount %s: %s", target, strerror(errno));
+    }
+  }
+
+  /* 2. Unmount early_mounts in reverse order (/run -> /sys -> /proc -> /dev) */
+  size_t early_count = sizeof(early_mounts) / sizeof(early_mounts[0]);
+  for (size_t i = early_count; i > 0; i--)
+  {
+    const char *target = early_mounts[i - 1].target;
+    if (umount(target) == -1 && errno == EBUSY)
+      umount2(target, MNT_DETACH);
+  }
+
+  /* 3. Remount / read-only to flush metadata cleanly */
+  if (mount(NULL, "/", NULL, MS_REMOUNT | MS_RDONLY, NULL) == -1)
+    log_message(LOG_ERROR, "Failed to remount / read-only: %s", strerror(errno));
+  else
+    log_message(LOG_INFO, "Remounted / read-only");
 }
